@@ -58,6 +58,9 @@ type Handler struct {
 	// Filename of the PAC file to serve.
 	PACPath string `json:"pac_path,omitempty"`
 
+	// Is PAC file template on FS
+	PACTemplate string `json:"pac_template,omitempty"`
+
 	// If true, the Forwarded header will not be augmented with your IP address.
 	HideIP bool `json:"hide_ip,omitempty"`
 
@@ -93,6 +96,11 @@ type Handler struct {
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
+
+	// Ldap connections struct
+	Ldap *Ldap
+	// Ldap configurations struct
+	LdapConfig *LdapConfig `json:"ldap_auth,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -103,9 +111,39 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+func (h *Handler) Cleanup() error {
+	if h.LdapConfig != nil {
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+
+		for {
+			select {
+			case con := <-h.Ldap.Pool:
+				con.Close()
+			case <-timer.C:
+				if len(h.Ldap.Pool) > 0 {
+					return fmt.Errorf("Error Ldap connections cleanup")
+				}
+			default:
+				if len(h.Ldap.Pool) == 0 {
+					return nil
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // Provision ensures that h is set up properly before use.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
+
+	if h.LdapConfig != nil {
+		err := h.ldapInit()
+		if err != nil {
+			return err
+		}
+	}
 
 	if h.DialTimeout <= 0 {
 		h.DialTimeout = caddy.Duration(30 * time.Second)
@@ -129,12 +167,15 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 	for _, ipDeny := range []string{
+		"100.64.0.0/10",
 		"10.0.0.0/8",
 		"127.0.0.0/8",
 		"172.16.0.0/12",
 		"192.168.0.0/16",
 		"::1/128",
 		"fe80::/10",
+		"fc00::/7",
+		"64:ff9b::/96",
 	} {
 		ar, err := newACLRule(ipDeny, false)
 		if err != nil {
@@ -145,11 +186,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.aclRules = append(h.aclRules, &aclAllRule{allow: true})
 
 	if h.ProbeResistance != nil {
-		if h.AuthCredentials == nil {
+		if h.AuthCredentials == nil && h.LdapConfig == nil {
 			return fmt.Errorf("probe resistance requires authentication")
 		}
 		if len(h.ProbeResistance.Domain) > 0 {
-			h.logger.Info("Secret domain used to connect to proxy: " + h.ProbeResistance.Domain)
+			h.logger.Info("Hidden domain used: " + h.ProbeResistance.Domain)
 		}
 	}
 
@@ -227,7 +268,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	var authErr error
-	if h.AuthCredentials != nil {
+	if h.AuthCredentials != nil || h.LdapConfig != nil {
 		authErr = h.checkCredentials(r)
 	}
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
@@ -239,6 +280,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if h.shouldServePACFile(r) {
 			return h.servePacFile(w, r)
 		}
+		// TODO: Check this
+		// HERE WE PROBABLY SHOULD BLOCK OTHER PASSTHROUGH
 		return next.ServeHTTP(w, r)
 	}
 	if authErr != nil {
@@ -402,7 +445,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return forwardResponse(w, response)
 }
 
-func (h Handler) checkCredentials(r *http.Request) error {
+func (h *Handler) checkCredentials(r *http.Request) error {
 	pa := strings.Split(r.Header.Get("Proxy-Authorization"), " ")
 	if len(pa) != 2 {
 		return errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>")
@@ -432,6 +475,17 @@ func (h Handler) checkCredentials(r *http.Request) error {
 	}
 	if utf8.Valid(buf[:n]) {
 		cred := string(buf[:n])
+
+		if h.LdapConfig != nil {
+			err := h.verifyLdapLoginAndPassword(cred)
+			if err == nil {
+				repl.Set("http.auth.user.id", cred[:strings.IndexByte(cred, ':')])
+				return nil
+			} else {
+				h.logger.Info(err.Error())
+			}
+		}
+
 		i := strings.IndexByte(cred, ':')
 		if i >= 0 {
 			repl.Set("http.auth.user.id", "invalid:"+cred[:i])
@@ -449,7 +503,22 @@ func (h Handler) shouldServePACFile(r *http.Request) bool {
 }
 
 func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
-	fmt.Fprintf(w, pacFile, r.Host)
+	var pacContent string
+
+	if len(h.PACTemplate) > 0 {
+		contentList, err := readLinesFromFile(h.PACTemplate)
+		if err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
+		}
+		pacContent = strings.Join(contentList, "\n")
+	} else {
+		pacContent = pacFile
+	}
+
+	headerAttachment := fmt.Sprintf("attachment; filename=%s", filepath.Base(h.PACPath))
+	w.Header().Set("Content-Dispostion", headerAttachment)
+	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
+	fmt.Fprintf(w, pacContent, r.Host)
 	// fmt.Fprintf(w, pacFile, h.hostname, h.port)
 	return nil
 }
@@ -776,17 +845,18 @@ func readLinesFromFile(filename string) ([]string, error) {
 	}
 	defer file.Close()
 
-	var hostnames []string
+	var content []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		hostnames = append(hostnames, scanner.Text())
+		content = append(content, scanner.Text())
 	}
 
-	return hostnames, scanner.Err()
+	return content, scanner.Err()
 }
 
 // Interface guards
 var (
+	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)

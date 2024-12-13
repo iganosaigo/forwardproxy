@@ -3,6 +3,7 @@ package forwardproxy
 import (
 	"encoding/base64"
 	"log"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -30,6 +31,67 @@ func EncodeAuthCredentials(user, pass string) (result []byte) {
 	return
 }
 
+// Separate logic for unmarshaling Ldap caddyfile params
+func (h *Handler) caddyfileLdap(d *caddyfile.Dispenser) error {
+	if h.LdapConfig == nil {
+		h.LdapConfig = &LdapConfig{}
+	}
+	for nesting := d.Nesting(); d.NextBlock(nesting); {
+		option := d.Val()
+		args := d.RemainingArgs()
+		switch option {
+		case "url":
+			ldapUrl, err := url.Parse(args[0])
+			if err != nil {
+				return d.Errf("parsing option '%s' url: %v", ldapUrl, err)
+			}
+			h.LdapConfig.Url = ldapUrl
+		case "timeout":
+			timeout, err := caddy.ParseDuration(args[0])
+			if err != nil {
+				return d.ArgErr()
+			}
+			if timeout < 0 {
+				return d.Err("Ldap timeout cannot be negative.")
+			}
+			h.LdapConfig.Timeout = timeout
+		case "base_dn":
+			h.LdapConfig.BaseDN = args[0]
+		case "user_suffix":
+			h.LdapConfig.UserSuffix = args[0]
+		case "user_group":
+			h.LdapConfig.UserGroup = args[0]
+		case "filter_dn":
+			h.LdapConfig.FilterDN = args[0]
+		case "bind_dn":
+			h.LdapConfig.BindDN = args[0]
+		case "bind_pass":
+			h.LdapConfig.BindPasswd = args[0]
+		case "pool_size":
+			var err error
+			size, err := strconv.Atoi(args[0])
+			if size <= 0 || size > 100 || err != nil {
+				return d.Errf("Choose appropriate LDAP connections pool size in 1-100 range, got: %d", size)
+			}
+			h.LdapConfig.PoolSize = size
+		case "cache_use":
+			h.LdapConfig.CacheUse = true
+		case "cache_ttl":
+			var err error
+			cacheTTL, err := caddy.ParseDuration(args[0])
+			duration := int(cacheTTL.Seconds())
+			if duration <= 0 || duration > 86400 || err != nil {
+				return d.Errf("Choose appropriate LDAP cache time(up to 1 day), got: %d cacheTTL", duration)
+			}
+			h.LdapConfig.CacheTTL = cacheTTL
+		default:
+			return d.ArgErr()
+		}
+	}
+
+	return nil
+}
+
 // UnmarshalCaddyfile unmarshals Caddyfile tokens into h.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if !d.Next() {
@@ -43,6 +105,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		subdirective := d.Val()
 		args := d.RemainingArgs()
 		switch subdirective {
+		case "ldap_auth":
+			err := h.caddyfileLdap(d)
+			if err != nil {
+				return err
+			}
 		case "basic_auth":
 			if len(args) != 2 {
 				return d.ArgErr()
@@ -118,6 +185,17 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 			} else {
 				h.PACPath = "/proxy.pac"
+			}
+		case "template_pac":
+			if len(h.PACTemplate) != 0 {
+				return d.Err("serve_pac subdirective specified twice")
+			}
+			if len(args) != 1 {
+				return d.ArgErr()
+			}
+			h.PACTemplate = args[0]
+			if !strings.HasPrefix(h.PACTemplate, "/") {
+				h.PACTemplate = "/" + h.PACTemplate
 			}
 		case "dial_timeout":
 			if len(args) != 1 {
